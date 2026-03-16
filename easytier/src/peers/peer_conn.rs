@@ -690,7 +690,7 @@ impl PeerConn {
     /// | Admin | SharedNode | pinned key match | PeerVerified | EncryptedUnauthenticated | SharedNode | SharedNode |
     /// | Admin | SharedNode | local has no pinned key requirement | EncryptedUnauthenticated | EncryptedUnauthenticated | SharedNode | SharedNode |
     /// | Credential | SharedNode | no pin and not trusted | EncryptedUnauthenticated | EncryptedUnauthenticated | SharedNode | SharedNode |
-    /// | Credential | Credential | both keys trusted by admin distribution | PeerVerified | PeerVerified | Credential | Credential |
+    /// | Credential | Credential | should reject | handshake reject | handshake reject | unknown | unknown |
     ///
     /// Logic (in priority order):
     /// 1. **NetworkSecretConfirmed**: proof verification succeeds
@@ -699,6 +699,7 @@ impl PeerConn {
     /// 3. **PeerVerified**: pubkey is in trusted list
     /// 4. **EncryptedUnauthenticated**: initiator without network_secret
     /// 5. **Reject**: none of the above
+    #[allow(clippy::too_many_arguments)]
     fn verify_remote_auth(
         &self,
         proof: Option<&[u8]>,
@@ -707,6 +708,7 @@ impl PeerConn {
         pinned_pubkey: Option<&[u8]>,
         has_network_secret: bool,
         is_initiator: bool,
+        remote_network_name: &str,
     ) -> Result<SecureAuthLevel, Error> {
         // 1. Verify proof
         if let Some(proof) = proof {
@@ -725,7 +727,11 @@ impl PeerConn {
                 ));
             }
             // If no network_secret, pinned key must be in trusted list
-            if !has_network_secret && !self.global_ctx.is_pubkey_trusted(remote_pubkey) {
+            if !has_network_secret
+                && !self
+                    .global_ctx
+                    .is_pubkey_trusted(remote_pubkey, remote_network_name)
+            {
                 return Err(Error::WaitRespError(
                     "pinned pubkey not in trusted list".to_owned(),
                 ));
@@ -734,7 +740,10 @@ impl PeerConn {
         }
 
         // 3. Check if pubkey is in trusted list
-        if self.global_ctx.is_pubkey_trusted(remote_pubkey) {
+        if self
+            .global_ctx
+            .is_pubkey_trusted(remote_pubkey, remote_network_name)
+        {
             return Ok(SecureAuthLevel::PeerVerified);
         }
 
@@ -903,6 +912,7 @@ impl PeerConn {
                 pinned_remote_pubkey.as_deref(),
                 network.network_secret.is_some(),
                 true, // is_initiator
+                &remote_network_name,
             )?
         };
         let peer_identity_type = self.classify_remote_identity(
@@ -1154,6 +1164,7 @@ impl PeerConn {
                     .network_secret
                     .is_some(),
                 false, // is_initiator
+                &remote_network_name,
             )?
         } else {
             SecureAuthLevel::EncryptedUnauthenticated
@@ -1430,9 +1441,9 @@ impl PeerConn {
         let info = self.info.as_ref().unwrap();
         let mut ret = NetworkIdentity {
             network_name: info.network_name.clone(),
-            ..Default::default()
+            network_secret: None,
+            network_secret_digest: Some([0u8; 32]),
         };
-        ret.network_secret_digest = Some([0u8; 32]);
         ret.network_secret_digest
             .as_mut()
             .unwrap()
@@ -1608,7 +1619,15 @@ pub mod tests {
         assert_eq!(c_peer.get_peer_id(), s_peer_id);
         assert_eq!(s_peer.get_peer_id(), c_peer_id);
         assert_eq!(c_peer.get_network_identity(), s_peer.get_network_identity());
-        assert_eq!(c_peer.get_network_identity(), NetworkIdentity::default());
+        assert_eq!(
+            c_peer.get_network_identity().network_name,
+            NetworkIdentity::default().network_name
+        );
+        assert_eq!(c_peer.get_network_identity().network_secret, None);
+        assert_eq!(
+            c_peer.get_network_identity().network_secret_digest,
+            NetworkIdentity::default().network_secret_digest
+        );
     }
 
     #[tokio::test]
