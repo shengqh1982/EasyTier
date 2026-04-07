@@ -1,29 +1,13 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
 use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
     hash::Hasher,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-
-use crate::common::config::ProxyNetworkConfig;
-use crate::common::shrink_dashmap;
-use crate::common::stats_manager::StatsManager;
-use crate::common::token_bucket::TokenBucketManager;
-use crate::peers::acl_filter::AclFilter;
-use crate::peers::credential_manager::CredentialManager;
-use crate::proto::acl::GroupIdentity;
-use crate::proto::api::config::InstanceConfigPatch;
-use crate::proto::api::instance::PeerConnInfo;
-use crate::proto::common::{PeerFeatureFlag, PortForwardConfigPb};
-use crate::proto::peer_rpc::PeerGroupInfo;
-use crossbeam::atomic::AtomicCell;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 use super::{
     config::{ConfigLoader, Flags},
@@ -32,6 +16,24 @@ use super::{
     stun::{StunInfoCollector, StunInfoCollectorTrait},
     PeerId,
 };
+use crate::{
+    common::{
+        config::ProxyNetworkConfig, shrink_dashmap, stats_manager::StatsManager,
+        token_bucket::TokenBucketManager,
+    },
+    peers::{acl_filter::AclFilter, credential_manager::CredentialManager},
+    proto::{
+        acl::GroupIdentity,
+        api::{config::InstanceConfigPatch, instance::PeerConnInfo},
+        common::{PeerFeatureFlag, PortForwardConfigPb},
+        peer_rpc::PeerGroupInfo,
+    },
+    tunnel::matches_protocol,
+};
+use crossbeam::atomic::AtomicCell;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use socket2::Protocol;
 
 pub type NetworkIdentity = crate::common::config::NetworkIdentity;
 
@@ -242,6 +244,7 @@ impl GlobalCtx {
         feature_flags.quic_input = !flags.disable_quic_input;
         feature_flags.no_relay_quic = flags.disable_relay_quic;
         feature_flags.need_p2p = flags.need_p2p;
+        feature_flags.disable_p2p = flags.disable_p2p;
         feature_flags
     }
 
@@ -625,15 +628,11 @@ impl GlobalCtx {
     }
 
     fn is_port_in_running_listeners(&self, port: u16, is_udp: bool) -> bool {
-        let check_proto = |listener_proto: &str| {
-            let listener_is_udp = matches!(listener_proto, "udp" | "wg");
-            listener_is_udp == is_udp
-        };
         self.running_listeners
             .lock()
             .unwrap()
             .iter()
-            .any(|x| x.port() == Some(port) && check_proto(x.scheme()))
+            .any(|x| x.port() == Some(port) && matches_protocol!(x, Protocol::UDP) == is_udp)
     }
 
     #[tracing::instrument(ret, skip(self))]
@@ -745,12 +744,13 @@ pub mod tests {
         feature_flags.is_public_server = true;
         global_ctx.set_feature_flags(feature_flags);
 
-        let mut flags = global_ctx.get_flags();
+        let mut flags = global_ctx.get_flags().clone();
         flags.disable_kcp_input = true;
         flags.disable_relay_kcp = true;
         flags.disable_quic_input = true;
         flags.disable_relay_quic = true;
         flags.need_p2p = true;
+        flags.disable_p2p = true;
         global_ctx.set_flags(flags);
 
         let feature_flags = global_ctx.get_feature_flags();
@@ -759,6 +759,7 @@ pub mod tests {
         assert!(!feature_flags.quic_input);
         assert!(feature_flags.no_relay_quic);
         assert!(feature_flags.need_p2p);
+        assert!(feature_flags.disable_p2p);
         assert!(feature_flags.support_conn_list_sync);
         assert!(feature_flags.avoid_relay_data);
         assert!(feature_flags.is_public_server);

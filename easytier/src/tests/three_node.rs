@@ -156,14 +156,14 @@ async fn init_three_node_ex_with_inst3<F: Fn(TomlConfigLoader) -> TomlConfigLoad
         #[cfg(feature = "websocket")]
         inst1
             .get_conn_manager()
-            .add_connector(crate::tunnel::websocket::WSTunnelConnector::new(
+            .add_connector(crate::tunnel::websocket::WsTunnelConnector::new(
                 "ws://10.1.1.2:11011".parse().unwrap(),
             ));
     } else if proto == "wss" {
         #[cfg(feature = "websocket")]
         inst1
             .get_conn_manager()
-            .add_connector(crate::tunnel::websocket::WSTunnelConnector::new(
+            .add_connector(crate::tunnel::websocket::WsTunnelConnector::new(
                 "wss://10.1.1.2:11012".parse().unwrap(),
             ));
     }
@@ -2561,6 +2561,73 @@ pub async fn need_p2p_overrides_lazy_p2p() {
     )
     .await;
     wait_route_cost(&insts[0], inst3_peer_id, 1, Duration::from_secs(10)).await;
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn disable_p2p_still_connects_to_need_p2p_peers() {
+    let insts = init_lazy_p2p_three_node_ex("udp", |cfg| {
+        let mut flags = cfg.get_flags();
+        if cfg.get_inst_name() == "inst1" {
+            flags.disable_p2p = true;
+        }
+        if cfg.get_inst_name() == "inst3" {
+            flags.need_p2p = true;
+        }
+        cfg.set_flags(flags);
+        cfg
+    })
+    .await;
+
+    let inst3_peer_id = insts[2].peer_id();
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(5)).await;
+    wait_for_condition(
+        || async {
+            insts[0]
+                .get_peer_manager()
+                .get_peer_map()
+                .has_peer(inst3_peer_id)
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_route_cost(&insts[0], inst3_peer_id, 1, Duration::from_secs(10)).await;
+
+    drop_insts(insts).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+pub async fn ordinary_nodes_do_not_proactively_connect_to_disable_p2p_peers() {
+    let insts = init_lazy_p2p_three_node_ex("udp", |cfg| {
+        if cfg.get_inst_name() == "inst3" {
+            let mut flags = cfg.get_flags();
+            flags.disable_p2p = true;
+            cfg.set_flags(flags);
+        }
+        cfg
+    })
+    .await;
+
+    let inst3_peer_id = insts[2].peer_id();
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(5)).await;
+    assert!(
+        ping_test("net_a", "10.144.144.3", None).await,
+        "relay traffic to disable-p2p peers should still succeed"
+    );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert!(
+        !insts[0]
+            .get_peer_manager()
+            .get_peer_map()
+            .has_peer(inst3_peer_id),
+        "ordinary nodes should not proactively establish p2p with disable-p2p peers"
+    );
+    wait_route_cost(&insts[0], inst3_peer_id, 2, Duration::from_secs(3)).await;
 
     drop_insts(insts).await;
 }
