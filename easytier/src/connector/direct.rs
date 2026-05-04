@@ -51,6 +51,37 @@ pub const DIRECT_CONNECTOR_BLACKLIST_TIMEOUT_SEC: u64 = 300;
 
 static TESTING: AtomicBool = AtomicBool::new(false);
 
+fn mapped_listener_port(url: &url::Url) -> Option<u16> {
+    url.port().or_else(|| {
+        TunnelScheme::try_from(url)
+            .ok()
+            .and_then(|scheme| IpScheme::try_from(scheme).ok())
+            .map(IpScheme::default_port)
+    })
+}
+
+async fn resolve_mapped_listener_addrs(listener: &url::Url) -> Result<Vec<SocketAddr>, Error> {
+    socket_addrs(listener, || mapped_listener_port(listener)).await
+}
+
+fn is_usable_public_ipv6_candidate(ip: &Ipv6Addr, global_ctx: &ArcGlobalCtx) -> bool {
+    is_usable_public_ipv6_candidate_with_mode(ip, global_ctx, TESTING.load(Ordering::Relaxed))
+}
+
+fn is_usable_public_ipv6_candidate_with_mode(
+    ip: &Ipv6Addr,
+    global_ctx: &ArcGlobalCtx,
+    testing: bool,
+) -> bool {
+    !global_ctx.is_ip_easytier_managed_ipv6(ip)
+        && (testing
+            || (!ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_unique_local()
+                && !ip.is_unicast_link_local()
+                && !ip.is_multicast()))
+}
+
 #[async_trait::async_trait]
 pub trait PeerManagerForDirectConnector {
     async fn list_peers(&self) -> Vec<PeerId>;
@@ -132,7 +163,7 @@ impl DirectConnectorManagerData {
         }
 
         let global_ctx = self.peer_manager.get_global_ctx();
-        let listener_port = remote_url.port().ok_or(anyhow::anyhow!(
+        let listener_port = mapped_listener_port(remote_url).ok_or(anyhow::anyhow!(
             "failed to parse port from remote url: {}",
             remote_url
         ))?;
@@ -177,34 +208,28 @@ impl DirectConnectorManagerData {
                 .with_context(|| format!("failed to bind local socket for {}", remote_url))?,
         );
         let connector_ip = self
-            .peer_manager
-            .get_global_ctx()
+            .global_ctx
             .get_stun_info_collector()
             .get_stun_info()
             .public_ip
             .iter()
-            .find(|x| x.contains(':'))
-            .ok_or(anyhow::anyhow!(
-                "failed to get public ipv6 address from stun info"
-            ))?
-            .parse::<Ipv6Addr>()
-            .with_context(|| {
-                format!(
-                    "failed to parse public ipv6 address from stun info: {:?}",
-                    self.peer_manager
-                        .get_global_ctx()
-                        .get_stun_info_collector()
-                        .get_stun_info()
-                )
-            })?;
-        let connector_addr =
-            SocketAddr::new(IpAddr::V6(connector_ip), local_socket.local_addr()?.port());
+            .filter_map(|ip| ip.parse::<Ipv6Addr>().ok())
+            .find(|ip| !self.global_ctx.is_ip_easytier_managed_ipv6(ip));
 
         // ask remote to send v6 hole punch packet
         // and no matter what the result is, continue to connect
-        let _ = self
-            .remote_send_udp_hole_punch_packet(dst_peer_id, connector_addr, remote_url)
-            .await;
+        if let Some(connector_ip) = connector_ip {
+            let connector_addr =
+                SocketAddr::new(IpAddr::V6(connector_ip), local_socket.local_addr()?.port());
+            let _ = self
+                .remote_send_udp_hole_punch_packet(dst_peer_id, connector_addr, remote_url)
+                .await;
+        } else {
+            tracing::debug!(
+                ?remote_url,
+                "skip remote IPv6 hole-punch packet; no non-EasyTier public IPv6 in STUN info"
+            );
+        }
 
         let udp_connector = UdpTunnelConnector::new(remote_url.clone());
         let remote_addr = SocketAddr::from_url(remote_url.clone(), IpVersion::V6).await?;
@@ -382,7 +407,7 @@ impl DirectConnectorManagerData {
         listener: &url::Url,
         tasks: &mut JoinSet<Result<(), Error>>,
     ) {
-        let Ok(mut addrs) = socket_addrs(listener, || None).await else {
+        let Ok(mut addrs) = resolve_mapped_listener_addrs(listener).await else {
             tracing::error!(?listener, "failed to parse socket address from listener");
             return;
         };
@@ -466,14 +491,7 @@ impl DirectConnectorManagerData {
                         .iter()
                         .chain(ip_list.public_ipv6.iter())
                         .filter_map(|x| Ipv6Addr::from_str(&x.to_string()).ok())
-                        .filter(|x| {
-                            TESTING.load(Ordering::Relaxed)
-                                || (!x.is_loopback()
-                                    && !x.is_unspecified()
-                                    && !x.is_unique_local()
-                                    && !x.is_unicast_link_local()
-                                    && !x.is_multicast())
-                        })
+                        .filter(|x| is_usable_public_ipv6_candidate(x, &self.global_ctx))
                         .collect::<HashSet<_>>()
                         .iter()
                         .for_each(|ip| {
@@ -502,6 +520,11 @@ impl DirectConnectorManagerData {
                                 );
                             }
                         });
+                } else if self.global_ctx.is_ip_easytier_managed_ipv6(s_addr.ip()) {
+                    tracing::debug!(
+                        ?listener,
+                        "skip EasyTier-managed IPv6 as direct-connect target"
+                    );
                 } else if !s_addr.ip().is_loopback() || TESTING.load(Ordering::Relaxed) {
                     if self
                         .global_ctx
@@ -536,7 +559,7 @@ impl DirectConnectorManagerData {
             .into_iter()
             .map(Into::<url::Url>::into)
             .filter_map(|l| if l.scheme() != "ring" { Some(l) } else { None })
-            .filter(|l| l.port().is_some() && l.host().is_some())
+            .filter(|l| mapped_listener_port(l).is_some() && l.host().is_some())
             .filter(|l| enable_ipv6 || !matches!(l.host().unwrap().to_owned(), Host::Ipv6(_)))
             .collect::<Vec<_>>();
 
@@ -762,13 +785,25 @@ impl DirectConnectorManager {
     pub fn run_as_client(&mut self) {
         self.client.start();
     }
+
+    #[cfg(test)]
+    pub(crate) async fn try_direct_connect_with_ip_list(
+        &self,
+        dst_peer_id: PeerId,
+        ip_list: GetIpListResponse,
+    ) -> Result<(), Error> {
+        self.data
+            .do_try_direct_connect_internal(dst_peer_id, ip_list)
+            .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use crate::{
+        common::global_ctx::tests::get_mock_global_ctx,
         connector::direct::{
             DirectConnectorManager, DirectConnectorManagerData, DstListenerUrlBlackListItem,
         },
@@ -778,12 +813,84 @@ mod tests {
             wait_route_appear_with_cost,
         },
         proto::peer_rpc::GetIpListResponse,
+        tunnel::{IpScheme, TunnelScheme, matches_scheme},
     };
 
-    use super::TESTING;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::{TESTING, mapped_listener_port, resolve_mapped_listener_addrs};
 
     #[tokio::test]
-    async fn direct_connector_mapped_listener() {
+    async fn public_ipv6_candidate_rejects_easytier_managed_addr_even_in_tests() {
+        let global_ctx = get_mock_global_ctx();
+        let managed_ipv6: cidr::Ipv6Inet = "2001:db8::2/128".parse().unwrap();
+        global_ctx.set_public_ipv6_routes(BTreeSet::from([managed_ipv6]));
+
+        assert!(!super::is_usable_public_ipv6_candidate_with_mode(
+            &"2001:db8::2".parse().unwrap(),
+            &global_ctx,
+            true,
+        ));
+        assert!(super::is_usable_public_ipv6_candidate_with_mode(
+            &"::1".parse().unwrap(),
+            &global_ctx,
+            true,
+        ));
+    }
+
+    #[test]
+    fn udp_ipv6_url_matches_hole_punch_branch_condition() {
+        let remote_url: url::Url = "udp://[2001:db8::1]:11010".parse().unwrap();
+        let takes_udp_ipv6_hole_punch_branch =
+            matches_scheme!(remote_url, TunnelScheme::Ip(IpScheme::Udp))
+                && matches!(remote_url.host(), Some(url::Host::Ipv6(_)));
+
+        assert!(takes_udp_ipv6_hole_punch_branch);
+    }
+
+    #[test]
+    fn mapped_listener_port_uses_ip_scheme_defaults() {
+        assert_eq!(
+            mapped_listener_port(&"ws://example.com".parse().unwrap()),
+            Some(80)
+        );
+        assert_eq!(
+            mapped_listener_port(&"wss://example.com".parse().unwrap()),
+            Some(443)
+        );
+        assert_eq!(
+            mapped_listener_port(&"tcp://127.0.0.1".parse().unwrap()),
+            Some(11010)
+        );
+        assert_eq!(
+            mapped_listener_port(&"udp://127.0.0.1".parse().unwrap()),
+            Some(11010)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_mapped_listener_addrs_uses_default_ports() {
+        let wss_addrs = resolve_mapped_listener_addrs(&"wss://127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            wss_addrs,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)]
+        );
+
+        let tcp_addrs = resolve_mapped_listener_addrs(&"tcp://127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            tcp_addrs,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 11010)]
+        );
+    }
+
+    async fn run_direct_connector_mapped_listener_test(
+        mapped_listener: &str,
+        target_listener: &str,
+    ) {
         TESTING.store(true, std::sync::atomic::Ordering::Relaxed);
         let p_a = create_mock_peer_manager().await;
         let p_b = create_mock_peer_manager().await;
@@ -802,11 +909,11 @@ mod tests {
 
         p_c.get_global_ctx()
             .config
-            .set_mapped_listeners(Some(vec!["tcp://127.0.0.1:11334".parse().unwrap()]));
+            .set_mapped_listeners(Some(vec![mapped_listener.parse().unwrap()]));
 
         p_x.get_global_ctx()
             .config
-            .set_listeners(vec!["tcp://0.0.0.0:11334".parse().unwrap()]);
+            .set_listeners(vec![target_listener.parse().unwrap()]);
         let mut lis_x = ListenerManager::new(p_x.get_global_ctx(), p_x.clone());
         lis_x.prepare_listeners().await.unwrap();
         lis_x.run().await.unwrap();
@@ -821,6 +928,12 @@ mod tests {
         wait_route_appear_with_cost(p_a.clone(), p_x.my_peer_id(), Some(1))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_connector_mapped_listener() {
+        run_direct_connector_mapped_listener_test("tcp://127.0.0.1:11334", "tcp://0.0.0.0:11334")
+            .await;
     }
 
     #[rstest::rstest]

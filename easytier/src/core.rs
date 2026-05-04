@@ -6,12 +6,12 @@ use crate::{
         config::{
             ConfigFileControl, ConfigLoader, ConsoleLoggerConfig, EncryptionAlgorithm,
             FileLoggerConfig, LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig,
-            TomlConfigLoader, VpnPortalConfig, load_config_from_file, process_secure_mode_cfg,
+            TomlConfigLoader, VpnPortalConfig, load_config_from_file, parse_mapped_listener_urls,
+            process_secure_mode_cfg,
         },
         constants::EASYTIER_VERSION,
         log,
     },
-    defer,
     instance_manager::NetworkInstanceManager,
     launcher::add_proxy_network_to_config,
     proto::common::{CompressionAlgoPb, SecureModeConfig},
@@ -22,6 +22,7 @@ use crate::{
 use anyhow::Context;
 use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
+use guarden::defer;
 use rust_i18n::t;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -169,6 +170,31 @@ struct NetworkOptions {
         help = t!("core_clap.ipv6").to_string()
     )]
     ipv6: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_PROVIDER",
+        help = t!("core_clap.ipv6_public_addr_provider").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    ipv6_public_addr_provider: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_AUTO",
+        help = t!("core_clap.ipv6_public_addr_auto").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    ipv6_public_addr_auto: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_PREFIX",
+        help = t!("core_clap.ipv6_public_addr_prefix").to_string()
+    )]
+    ipv6_public_addr_prefix: Option<String>,
 
     #[arg(
         short,
@@ -813,7 +839,7 @@ impl NetworkOptions {
     fn can_merge(
         &self,
         cfg: &TomlConfigLoader,
-        source: ConfigSource,
+        source: ConfigFileSource,
         explicit_config_file_count: usize,
         config_dir_file_count: usize,
     ) -> bool {
@@ -821,7 +847,7 @@ impl NetworkOptions {
             return false;
         }
 
-        if source == ConfigSource::CliConfigFile
+        if source == ConfigFileSource::CliConfigFile
             && explicit_config_file_count == 1
             && config_dir_file_count == 0
         {
@@ -832,7 +858,7 @@ impl NetworkOptions {
             return false;
         };
 
-        if source == ConfigSource::ConfigDir {
+        if source == ConfigFileSource::ConfigDir {
             return cfg.get_network_identity().network_name == *network_name;
         }
 
@@ -874,6 +900,20 @@ impl NetworkOptions {
             })?))
         }
 
+        if let Some(enabled) = self.ipv6_public_addr_provider {
+            cfg.set_ipv6_public_addr_provider(enabled);
+        }
+
+        if let Some(enabled) = self.ipv6_public_addr_auto {
+            cfg.set_ipv6_public_addr_auto(enabled);
+        }
+
+        if let Some(prefix) = &self.ipv6_public_addr_prefix {
+            cfg.set_ipv6_public_addr_prefix(Some(prefix.parse().with_context(|| {
+                format!("failed to parse ipv6 public address prefix: {}", prefix)
+            })?));
+        }
+
         if !self.peers.is_empty() {
             let mut peers = cfg.get_peers();
             peers.reserve(peers.len() + self.peers.len());
@@ -906,32 +946,7 @@ impl NetworkOptions {
         }
 
         if !self.mapped_listeners.is_empty() {
-            let mut errs = Vec::new();
-            cfg.set_mapped_listeners(Some(
-                self.mapped_listeners
-                    .iter()
-                    .map(|s| {
-                        s.parse()
-                            .with_context(|| format!("mapped listener is not a valid url: {}", s))
-                            .unwrap()
-                    })
-                    .map(|s: url::Url| {
-                        if s.port().is_none() {
-                            errs.push(anyhow::anyhow!("mapped listener port is missing: {}", s));
-                        }
-                        s
-                    })
-                    .collect::<Vec<_>>(),
-            ));
-            if !errs.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "{}",
-                    errs.iter()
-                        .map(|x| format!("{}", x))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ));
-            }
+            cfg.set_mapped_listeners(Some(parse_mapped_listener_urls(&self.mapped_listeners)?));
         }
 
         for n in self.proxy_networks.iter() {
@@ -1161,7 +1176,7 @@ impl NetworkOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigSource {
+enum ConfigFileSource {
     CliConfigFile,
     ConfigDir,
 }
@@ -1353,7 +1368,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     let mut config_files = if let Some(v) = cli.config_file {
         v.iter()
             .cloned()
-            .map(|path| (path, ConfigSource::CliConfigFile))
+            .map(|path| (path, ConfigFileSource::CliConfigFile))
             .collect()
     } else {
         vec![]
@@ -1376,7 +1391,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                 continue;
             }
             config_dir_file_count += 1;
-            config_files.push((path, ConfigSource::ConfigDir));
+            config_files.push((path, ConfigFileSource::ConfigDir));
         }
     }
     let config_file_count = config_files.len();
