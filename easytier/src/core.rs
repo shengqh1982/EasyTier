@@ -533,6 +533,17 @@ struct NetworkOptions {
     )]
     bind_device: Option<bool>,
 
+    // SO_MARK (fwmark) is a Linux-family kernel feature. Gate the flag out
+    // entirely on other targets so users on Windows/macOS/BSD don't see a
+    // `--socket-mark` they can't act on.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[arg(
+        long,
+        env = "ET_SOCKET_MARK",
+        help = t!("core_clap.socket_mark").to_string()
+    )]
+    socket_mark: Option<u32>,
+
     #[arg(
         long,
         env = "ET_ENABLE_KCP_PROXY",
@@ -880,17 +891,20 @@ impl NetworkOptions {
         }
 
         let old_ns = cfg.get_network_identity();
-        let network_name = self.network_name.clone().unwrap_or(old_ns.network_name);
+        let network_name = self
+            .network_name
+            .clone()
+            .unwrap_or_else(|| old_ns.network_name.clone());
 
         if self.credential.is_some() {
             // Credential mode: no network_secret, authenticate via credential keypair
             cfg.set_network_identity(NetworkIdentity::new_credential(network_name));
-        } else {
-            let network_secret = self
-                .network_secret
-                .clone()
-                .unwrap_or(old_ns.network_secret.unwrap_or_default());
+        } else if let Some(network_secret) = &self.network_secret {
+            cfg.set_network_identity(NetworkIdentity::new(network_name, network_secret.clone()));
+        } else if let Some(network_secret) = old_ns.network_secret {
             cfg.set_network_identity(NetworkIdentity::new(network_name, network_secret));
+        } else {
+            cfg.set_network_identity(NetworkIdentity::new_credential(network_name));
         }
 
         if let Some(dhcp) = self.dhcp {
@@ -1126,6 +1140,10 @@ impl NetworkOptions {
             .into();
         }
         f.bind_device = self.bind_device.unwrap_or(f.bind_device);
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            f.socket_mark = self.socket_mark.or(f.socket_mark);
+        }
         f.enable_kcp_proxy = self.enable_kcp_proxy.unwrap_or(f.enable_kcp_proxy);
         f.disable_kcp_input = self.disable_kcp_input.unwrap_or(f.disable_kcp_input);
         f.enable_quic_proxy = self.enable_quic_proxy.unwrap_or(f.enable_quic_proxy);
@@ -1723,5 +1741,34 @@ mod tests {
                 input
             );
         }
+    }
+
+    #[test]
+    fn test_network_options_merge_preserves_credential_identity() {
+        let cfg = TomlConfigLoader::new_from_str(
+            r#"
+[network_identity]
+network_name = "credential-network"
+network_secret = ""
+
+[secure_mode]
+enabled = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.get_network_identity().network_secret, None);
+
+        NetworkOptions {
+            hostname: Some("override-host".to_string()),
+            ..Default::default()
+        }
+        .merge_into(&cfg)
+        .unwrap();
+
+        let identity = cfg.get_network_identity();
+        assert_eq!(identity.network_name, "credential-network");
+        assert_eq!(identity.network_secret, None);
+        assert_eq!(identity.network_secret_digest, None);
+        assert_eq!(cfg.get_hostname(), "override-host");
     }
 }
